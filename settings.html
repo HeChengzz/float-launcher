@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>设置</title>
+  <link rel="stylesheet" href="/src/settings.css" />
+</head>
+<body>
+  <div class="win">
+    <header class="header">
+      <span class="title">设置</span>
+      <span class="spacer"></span>
+      <button class="close" id="btn-close" aria-label="关闭">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor"
+             stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 4l8 8M12 4l-8 8"/>
+        </svg>
+      </button>
+    </header>
+
+    <div class="body">
+      <section class="group">
+        <h3>外观</h3>
+
+        <div class="row">
+          <span class="label"><span class="name">主题颜色</span></span>
+          <div class="segmented" data-key="theme">
+            <button data-value="light">浅色</button>
+            <button data-value="dark">深色</button>
+            <button data-value="system">跟随系统</button>
+          </div>
+        </div>
+
+        <div class="row">
+          <span class="label"><span class="name">图标风格</span></span>
+          <div class="segmented" data-key="icon_style">
+            <button data-value="real">真实</button>
+            <button data-value="mask">遮罩</button>
+            <button data-value="redraw">重绘</button>
+          </div>
+        </div>
+
+        <div class="row">
+          <span class="label"><span class="name">图标大小</span></span>
+          <div class="slider-wrap">
+            <input type="range" id="rng-icon-size" min="32" max="96" step="2" />
+            <span class="value" id="val-icon-size">48</span>
+          </div>
+        </div>
+
+        <div class="row">
+          <span class="label"><span class="name">字体大小</span></span>
+          <div class="slider-wrap">
+            <input type="range" id="rng-font-size" min="10" max="18" step="1" />
+            <span class="value" id="val-font-size">12</span>
+          </div>
+        </div>
+
+        <div class="row">
+          <span class="label"><span class="name">字体样式</span></span>
+          <select id="sel-font-family">
+            <optgroup label="内置">
+              <option value="segoe">Segoe UI</option>
+              <option value="yahei">微软雅黑</option>
+              <option value="mono">等宽字体</option>
+              <option value="system">系统默认</option>
+            </optgroup>
+            <optgroup label="自定义" id="opt-custom"></optgroup>
+          </select>
+        </div>
+
+        <div class="row">
+          <span class="label">
+            <span class="name">字体上传</span>
+            <span class="desc" id="font-hint">支持 .ttf / .otf / .woff / .woff2</span>
+          </span>
+          <div class="upload-wrap">
+            <button class="upload-btn" id="btn-upload-font">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                   stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M8 10.5V3M5 6l3-3 3 3"/>
+                <path d="M2.75 10v2.25A1.25 1.25 0 0 0 4 13.5h8a1.25 1.25 0 0 0 1.25-1.25V10"/>
+              </svg>
+              <span>选择文件</span>
+            </button>
+          </div>
+        </div>
+
+	<div class="row">
+  	 <span class="label"><span class="name">Mica 强度</span></span>
+  	 	<div class="slider-wrap">
+   	 		<input type="range" id="rng-mica-strength" min="0" max="100" step="5" />
+   			<span class="value" id="val-mica-strength">30%</span>
+  		</div>
+	</div>
+      </section>
+
+      <div class="row">
+          <span class="label"><span class="name">面板透明度</span></span>
+          <div class="slider-wrap">
+              <input type="range" id="rng-opacity" min="0" max="100" step="1" />
+              <span class="value" id="val-opacity">100%</span>
+          </div>
+     </div>
+
+      <section class="group">
+        <h3>行为</h3>
+        <label class="row">
+          <span class="label">
+            <span class="name">游戏全屏时暂停</span>
+            <span class="desc">独占全屏游戏运行时（如 CS2、原神），快捷键和托盘不弹面板</span>
+          </span>
+          <input type="checkbox" id="chk-pause-fullscreen" />
+        </label>
+      </section>
+
+      <section class="group">
+        <h3>启动</h3>
+        <label class="row">
+          <span class="label">
+            <span class="name">开机自启</span>
+            <span class="desc">登录 Windows 时自动运行</span>
+          </span>
+          <input type="checkbox" id="chk-autostart" />
+        </label>
+      </section>
+
+      <section class="group">
+        <h3>快捷键</h3>
+        <div class="row readonly">
+          <span class="label"><span class="name">软件面板</span></span>
+          <kbd>Alt + 1</kbd>
+        </div>
+        <div class="row readonly">
+          <span class="label"><span class="name">文件面板</span></span>
+          <kbd>Alt + 2</kbd>
+        </div>
+      </section>
+    </div>
+
+    <footer class="footer">
+      <span>Floating Launcher</span>
+      <span id="version">v0.1.0</span>
+    </footer>
+  </div>
+  <script type="module" src="/src/settings.js"></script>
+</body>
+</html>

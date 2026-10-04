@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Floating Launcher</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div class="panel">
+    <header class="header">
+      <span class="title" id="title">面板</span>
+      <span class="spacer"></span>
+
+      <button class="btn" id="btn-new-folder" title="新建文件夹" aria-label="新建文件夹">
+        <svg class="icon" viewBox="0 0 16 16" fill="none"
+             stroke="currentColor" stroke-width="1.5"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2 4.75A1.25 1.25 0 0 1 3.25 3.5h2.1l1.15 1.5h6.25A1.25 1.25 0 0 1 14 6.25v5A1.25 1.25 0 0 1 12.75 12.5h-9.5A1.25 1.25 0 0 1 2 11.25z"/>
+          <path d="M8 7.25v3.5M6.25 9h3.5"/>
+        </svg>
+      </button>
+
+      <button class="btn" id="btn-new-file" title="新建文件" aria-label="新建文件">
+        <svg class="icon" viewBox="0 0 16 16" fill="none"
+             stroke="currentColor" stroke-width="1.5"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9.25 2h-4.5A1.25 1.25 0 0 0 3.5 3.25v9.5A1.25 1.25 0 0 0 4.75 14h6.5A1.25 1.25 0 0 0 12.5 12.75V5.25z"/>
+          <path d="M9.25 2v3.25H12.5"/>
+          <path d="M8 8.75v3.5M6.25 10.5h3.5"/>
+        </svg>
+      </button>
+
+      <button class="btn" id="btn-view" title="切换视图" aria-label="切换视图"></button>
+
+      <button class="btn" id="btn-scope" title="切换显示范围" aria-label="切换显示范围"></button>
+
+      <button class="btn" id="btn-settings" title="设置" aria-label="设置">
+        <svg class="icon" viewBox="0 0 16 16" fill="none"
+             stroke="currentColor" stroke-width="1.5"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2.5 5h11"/>
+          <path d="M2.5 11h11"/>
+          <circle cx="6" cy="5" r="1.65" fill="currentColor" stroke="none"/>
+          <circle cx="10" cy="11" r="1.65" fill="currentColor" stroke="none"/>
+        </svg>
+      </button>
+    </header>
+
+    <div class="search-wrap" id="search-wrap">
+      <svg class="search-icon" viewBox="0 0 16 16" fill="none"
+           stroke="currentColor" stroke-width="1.5"
+           stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="7" cy="7" r="4.5"/>
+        <path d="M10.5 10.5l3 3"/>
+      </svg>
+      <input type="text" class="search-input" id="search-input"
+             placeholder="搜索应用…"
+             spellcheck="false"
+             autocomplete="off"
+             autocorrect="off"
+             autocapitalize="off" />
+      <button class="search-clear" id="search-clear" aria-label="清除" title="清除">
+        <svg viewBox="0 0 16 16" fill="none"
+             stroke="currentColor" stroke-width="1.6"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 4l8 8M12 4l-8 8"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="content">
+      <div class="grid" id="list"></div>
+    </div>
+  </div>
+
+  <div class="confirm-overlay" id="confirm-overlay">
+    <div class="confirm-box">
+      <div class="confirm-title" id="confirm-title">确认</div>
+      <div class="confirm-msg" id="confirm-msg"></div>
+      <div class="confirm-actions">
+        <button class="confirm-btn" id="confirm-cancel">取消</button>
+        <button class="confirm-btn danger" id="confirm-ok">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="input-overlay" id="input-overlay">
+    <div class="input-box">
+      <div class="input-title" id="input-title">输入</div>
+      <input type="text" class="input-field" id="input-field"
+             spellcheck="false"
+             autocomplete="off"
+             autocorrect="off"
+             autocapitalize="off" />
+      <div class="input-actions">
+        <button class="confirm-btn" id="input-cancel">取消</button>
+        <button class="confirm-btn primary" id="input-ok">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
