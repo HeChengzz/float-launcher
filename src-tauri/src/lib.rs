@@ -5,7 +5,7 @@ use backend::{actions, icon::icon_data_url, lnk::resolve_lnk_target, scanner::*}
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -26,119 +26,238 @@ const BOTTOM_MARGIN: i32 = 15;
 const ANIM_STEP_MS: u64 = 14;
 const SHOW_DURATION: u64 = 240;
 const HIDE_DURATION: u64 = 180;
+const FULLSCREEN_POLL_MS: u64 = 500;
 
 // ============================================================
-//  系统检测
+//  内置白名单
 // ============================================================
 #[cfg(windows)]
-fn windows_build() -> u32 {
-    use winreg::enums::HKEY_LOCAL_MACHINE;
-    use winreg::RegKey;
+const BUILTIN_WHITELIST: &[&str] = &[
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+    "opera.exe", "vivaldi.exe", "iexplore.exe",
+    "code.exe", "code - insiders.exe", "cursor.exe",
+    "devenv.exe", "sublime_text.exe", "notepad++.exe",
+    "pycharm64.exe", "pycharm.exe", "idea64.exe", "idea.exe",
+    "rider64.exe", "goland64.exe", "webstorm64.exe",
+    "clion64.exe", "datagrip64.exe", "rustrover64.exe",
+    "phpstorm64.exe", "androidstudio64.exe",
+    "windowsterminal.exe", "wt.exe", "conhost.exe",
+    "powershell.exe", "pwsh.exe", "cmd.exe",
+    "mintty.exe", "alacritty.exe", "wezterm-gui.exe",
+    "explorer.exe",
+    "winword.exe", "excel.exe", "powerpnt.exe", "onenote.exe",
+    "wechat.exe", "weixin.exe", "qq.exe", "telegram.exe",
+    "discord.exe", "slack.exe", "teams.exe", "zoom.exe",
+    "ms-teams.exe",
+    "vlc.exe", "mpc-hc64.exe", "mpc-hc.exe", "mpv.exe",
+    "potplayer.exe", "potplayermini64.exe",
+    "mstsc.exe", "vmware-vmx.exe", "virtualboxvm.exe",
+];
 
-    if let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
-    {
-        if let Ok(build) = key.get_value::<String, _>("CurrentBuildNumber") {
-            if let Ok(n) = build.parse::<u32>() {
-                return n;
-            }
-        }
+// ============================================================
+//  进程名 / 窗口标题
+// ============================================================
+#[cfg(windows)]
+fn process_name_by_pid(pid: u32) -> String {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 { return String::new(); }
+    unsafe {
+        let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(h) if !h.is_invalid() => h,
+            _ => return String::new(),
+        };
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        )
+        .is_ok();
+        let _ = CloseHandle(handle);
+        if !ok || size == 0 { return String::new(); }
+        let os_str = std::ffi::OsString::from_wide(&buf[..size as usize]);
+        std::path::PathBuf::from(os_str)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
     }
-    0
 }
 
-#[cfg(not(windows))]
-fn windows_build() -> u32 { 0 }
-
 #[cfg(windows)]
-fn accent_color() -> String {
-    use windows::Win32::Foundation::BOOL;
-    use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
+unsafe fn window_title(hwnd: windows::Win32::Foundation::HWND) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowTextW;
+    let mut buf = [0u16; 512];
+    let len = GetWindowTextW(hwnd, &mut buf);
+    if len <= 0 { return String::new(); }
+    String::from_utf16_lossy(&buf[..len as usize])
+}
+
+fn matches_rule(process: &str, title: &str, rule: &str) -> bool {
+    let rule_lower = rule.trim().to_lowercase();
+    if rule_lower.is_empty() { return false; }
+    if rule_lower.ends_with(".exe") {
+        process.eq_ignore_ascii_case(&rule_lower)
+    } else {
+        title.to_lowercase().contains(&rule_lower)
+    }
+}
+
+// ============================================================
+//  窗口装饰
+// ============================================================
+#[cfg(windows)]
+fn setup_window_decoration(w: &WebviewWindow) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWMWCP_ROUND,
+    };
+
+    let Ok(hwnd_tauri) = w.hwnd() else { return; };
+    let raw = hwnd_tauri.0 as usize;
+    let hwnd = HWND(raw as *mut core::ffi::c_void);
 
     unsafe {
-        let mut color: u32 = 0;
-        let mut opaque = BOOL::default();
-        if DwmGetColorizationColor(&mut color, &mut opaque).is_ok() {
-            let r = (color >> 16) & 0xFF;
-            let g = (color >> 8) & 0xFF;
-            let b = color & 0xFF;
-            return format!("#{:02X}{:02X}{:02X}", r, g, b);
-        }
+        let pref = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &pref as *const _ as *const _,
+            std::mem::size_of_val(&pref) as u32,
+        );
+        let none: u32 = 0xFFFF_FFFE;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &none as *const _ as *const _,
+            std::mem::size_of_val(&none) as u32,
+        );
     }
-    "#0078D4".to_string()
 }
 
 #[cfg(not(windows))]
-fn accent_color() -> String { "#0078D4".to_string() }
+fn setup_window_decoration(_w: &WebviewWindow) {}
 
 // ============================================================
-//  材质
+//  背景模糊
 // ============================================================
-static ACTUAL_EFFECT: Mutex<Option<String>> = Mutex::new(None);
-
-fn apply_effects(w: &WebviewWindow) {
-    let app = w.app_handle();
-
-    let mica = WindowEffectsConfig {
-        effects: vec![Effect::Mica],
-        interactive: false,
-        ..Default::default()
-    };
-    if w.set_effects(mica).is_ok() {
-        *ACTUAL_EFFECT.lock().unwrap() = Some("mica".into());
-        eprintln!("[effects] Mica 已应用: {}", w.label());
-        let _ = app.emit("system-effect-changed", "mica");
+fn apply_blur_effect(w: &WebviewWindow, blur: u32) {
+    if blur == 0 {
+        let cfg = WindowEffectsConfig { effects: vec![], ..Default::default() };
+        let _ = w.set_effects(cfg);
         return;
     }
-
     let acrylic = WindowEffectsConfig {
         effects: vec![Effect::Acrylic],
         interactive: false,
         ..Default::default()
     };
-    if w.set_effects(acrylic).is_ok() {
-        *ACTUAL_EFFECT.lock().unwrap() = Some("acrylic".into());
-        eprintln!("[effects] Acrylic 已应用: {}", w.label());
-        let _ = app.emit("system-effect-changed", "acrylic");
-        return;
-    }
-
-    *ACTUAL_EFFECT.lock().unwrap() = Some("none".into());
-    eprintln!("[effects] 系统不支持材质: {}", w.label());
-    let _ = app.emit("system-effect-changed", "none");
-}
-
-fn apply_effects_deferred(w: WebviewWindow, delay_ms: u64) {
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-        let w2 = w.clone();
-        let app = w.app_handle().clone();
-        let _ = app.run_on_main_thread(move || {
-            apply_effects(&w2);
-        });
-    });
+    if w.set_effects(acrylic).is_ok() { return; }
+    let blur_eff = WindowEffectsConfig {
+        effects: vec![Effect::Blur],
+        interactive: false,
+        ..Default::default()
+    };
+    let _ = w.set_effects(blur_eff);
 }
 
 // ============================================================
-//  独占全屏
+//  全屏检测
 // ============================================================
 #[cfg(windows)]
-fn is_fullscreen_app_running() -> bool {
+fn is_d3d_fullscreen() -> bool {
     use windows::Win32::UI::Shell::{
         SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN,
     };
     unsafe {
         if let Ok(state) = SHQueryUserNotificationState() {
-            if state == QUNS_RUNNING_D3D_FULL_SCREEN {
-                return true;
-            }
+            if state == QUNS_RUNNING_D3D_FULL_SCREEN { return true; }
         }
     }
     false
 }
 
+#[cfg(windows)]
+fn is_foreground_fullscreen_game(app: &AppHandle) -> bool {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetShellWindow, GetWindowRect,
+        GetWindowThreadProcessId, IsIconic,
+    };
+
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() { return false; }
+        let shell = GetShellWindow();
+        if fg == shell { return false; }
+
+        for label in ["launcher", "files", "settings"] {
+            if let Some(w) = app.get_webview_window(label) {
+                if let Ok(h) = w.hwnd() {
+                    if h.0 == fg.0 { return false; }
+                }
+            }
+        }
+
+        if IsIconic(fg).as_bool() { return false; }
+
+        let mut rect = RECT::default();
+        if GetWindowRect(fg, &mut rect).is_err() { return false; }
+
+        let hmon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(hmon, &mut mi).as_bool() { return false; }
+
+        let m = mi.rcMonitor;
+        let covers_monitor =
+            rect.left <= m.left
+            && rect.top <= m.top
+            && rect.right >= m.right
+            && rect.bottom >= m.bottom;
+        if !covers_monitor { return false; }
+
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(fg, Some(&mut pid));
+        let process = process_name_by_pid(pid);
+        let title = window_title(fg);
+
+        for rule in BUILTIN_WHITELIST {
+            if process.eq_ignore_ascii_case(rule) { return false; }
+        }
+
+        let cfg = app.state::<PanelState>().config_snapshot();
+        for rule in &cfg.non_game_whitelist {
+            if matches_rule(&process, &title, rule) { return false; }
+        }
+
+        true
+    }
+}
+
+#[cfg(windows)]
+fn is_fullscreen_app_running(app: &AppHandle) -> bool {
+    if is_d3d_fullscreen() { return true; }
+    if is_foreground_fullscreen_game(app) { return true; }
+    false
+}
+
 #[cfg(not(windows))]
-fn is_fullscreen_app_running() -> bool { false }
+fn is_fullscreen_app_running(_app: &AppHandle) -> bool { false }
 
 // ============================================================
 //  配置
@@ -151,8 +270,6 @@ struct CustomFont {
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct Config {
-    #[serde(default = "default_theme")]
-    theme: String,
     #[serde(default = "default_icon_style")]
     icon_style: String,
     #[serde(default = "default_icon_size")]
@@ -161,38 +278,46 @@ struct Config {
     font_size: u32,
     #[serde(default = "default_font_family")]
     font_family: String,
-    #[serde(default = "default_mica_strength")]
-    mica_strength: u32,
-    /// 面板整体不透明度 0~100
-    #[serde(default = "default_opacity")]
-    opacity: u32,
     #[serde(default)]
     custom_fonts: Vec<CustomFont>,
     #[serde(default = "default_pause_on_fullscreen")]
     pause_on_fullscreen: bool,
+    #[serde(default = "default_launcher_width")]
+    launcher_width: u32,
+    #[serde(default = "default_files_width")]
+    files_width: u32,
+    #[serde(default = "default_opacity")]
+    opacity: u32,
+    #[serde(default = "default_blur")]
+    blur: u32,
+    #[serde(default)]
+    non_game_whitelist: Vec<String>,
 }
 
-fn default_theme() -> String { "system".into() }
 fn default_icon_style() -> String { "mask".into() }
 fn default_icon_size() -> u32 { 48 }
 fn default_font_size() -> u32 { 12 }
 fn default_font_family() -> String { "segoe".into() }
-fn default_mica_strength() -> u32 { 30 }
-fn default_opacity() -> u32 { 100 }
 fn default_pause_on_fullscreen() -> bool { true }
+fn default_launcher_width() -> u32 { 480 }
+fn default_files_width() -> u32 { 400 }
+fn default_opacity() -> u32 { 100 }
+fn default_blur() -> u32 { 0 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            theme: default_theme(),
             icon_style: default_icon_style(),
             icon_size: default_icon_size(),
             font_size: default_font_size(),
             font_family: default_font_family(),
-            mica_strength: default_mica_strength(),
-            opacity: default_opacity(),
             custom_fonts: Vec::new(),
             pause_on_fullscreen: default_pause_on_fullscreen(),
+            launcher_width: default_launcher_width(),
+            files_width: default_files_width(),
+            opacity: default_opacity(),
+            blur: default_blur(),
+            non_game_whitelist: Vec::new(),
         }
     }
 }
@@ -235,6 +360,7 @@ struct PanelState {
     launcher_target: AtomicBool,
     files_token: AtomicI32,
     files_target: AtomicBool,
+    shortcuts_suspended: AtomicBool,
     config: RwLock<Config>,
 }
 
@@ -245,6 +371,7 @@ impl PanelState {
             launcher_target: AtomicBool::new(false),
             files_token: AtomicI32::new(0),
             files_target: AtomicBool::new(false),
+            shortcuts_suspended: AtomicBool::new(false),
             config: RwLock::new(config),
         }
     }
@@ -275,28 +402,23 @@ impl PanelState {
 }
 
 // ============================================================
-//  Payloads
+//  Settings payload
 // ============================================================
 #[derive(serde::Serialize)]
 struct SettingsPayload {
-    theme: String,
     icon_style: String,
     icon_size: u32,
     font_size: u32,
     font_family: String,
-    mica_strength: u32,
-    opacity: u32,
     custom_fonts: Vec<CustomFont>,
     pause_on_fullscreen: bool,
     autostart: bool,
     version: String,
-}
-
-#[derive(serde::Serialize)]
-struct SystemInfo {
-    build: u32,
-    effect: String,
-    accent: String,
+    launcher_width: u32,
+    files_width: u32,
+    opacity: u32,
+    blur: u32,
+    non_game_whitelist: Vec<String>,
 }
 
 // ============================================================
@@ -313,6 +435,36 @@ fn scan_uwp() -> Vec<Item> { scan_uwp_apps() }
 
 #[tauri::command]
 fn scan_files() -> (Vec<Item>, Vec<Item>) { scan_desktop_contents() }
+
+#[tauri::command]
+fn list_dir(path: String) -> Result<(Vec<Item>, Vec<Item>), String> {
+    let p = PathBuf::from(&path);
+    if !p.is_dir() {
+        return Err("not a directory".into());
+    }
+    let mut folders = Vec::new();
+    let mut files = Vec::new();
+    let rd = std::fs::read_dir(&p).map_err(|e| e.to_string())?;
+    for e in rd.flatten() {
+        let ep = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
+        let lower = name.to_lowercase();
+        if lower == "desktop.ini" || lower == "thumbs.db" || lower == ".ds_store" {
+            continue;
+        }
+        let is_dir = ep.is_dir();
+        let it = Item {
+            name,
+            path: ep.to_string_lossy().into_owned(),
+            is_dir,
+            kind: if is_dir { "folder".into() } else { "file".into() },
+        };
+        if is_dir { folders.push(it); } else { files.push(it); }
+    }
+    folders.sort_by_key(|i| i.name.to_lowercase());
+    files.sort_by_key(|i| i.name.to_lowercase());
+    Ok((folders, files))
+}
 
 #[tauri::command]
 fn icon(path: String) -> Option<String> {
@@ -369,35 +521,23 @@ fn hide_panel_cmd(app: AppHandle, label: String) {
 }
 
 #[tauri::command]
-fn get_system_info() -> SystemInfo {
-    let effect = ACTUAL_EFFECT
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .unwrap_or_else(|| "none".to_string());
-    SystemInfo {
-        build: windows_build(),
-        effect,
-        accent: accent_color(),
-    }
-}
-
-#[tauri::command]
 fn get_settings(app: AppHandle) -> SettingsPayload {
     let cfg = app.state::<PanelState>().config_snapshot();
     let autostart = app.autolaunch().is_enabled().unwrap_or(false);
     SettingsPayload {
-        theme: cfg.theme,
         icon_style: cfg.icon_style,
         icon_size: cfg.icon_size,
         font_size: cfg.font_size,
         font_family: cfg.font_family,
-        mica_strength: cfg.mica_strength,
-        opacity: cfg.opacity,
         custom_fonts: cfg.custom_fonts,
         pause_on_fullscreen: cfg.pause_on_fullscreen,
         autostart,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        launcher_width: cfg.launcher_width,
+        files_width: cfg.files_width,
+        opacity: cfg.opacity,
+        blur: cfg.blur,
+        non_game_whitelist: cfg.non_game_whitelist,
     }
 }
 
@@ -412,14 +552,6 @@ fn set_setting(
     let snapshot = {
         let mut cfg = state.config.write().unwrap();
         match key.as_str() {
-            "theme" => {
-                let v = value.as_str().unwrap_or("system");
-                let v = match v {
-                    "light" | "dark" | "system" => v,
-                    _ => return Err("invalid theme".into()),
-                };
-                cfg.theme = v.to_string();
-            }
             "icon_style" => {
                 let v = value.as_str().unwrap_or("mask");
                 let v = match v {
@@ -443,14 +575,36 @@ fn set_setting(
                 }
                 cfg.font_family = v.to_string();
             }
-            "mica_strength" => {
-                cfg.mica_strength = value.as_u64().unwrap_or(30).clamp(0, 100) as u32;
+            "pause_on_fullscreen" => {
+                cfg.pause_on_fullscreen = value.as_bool().unwrap_or(true);
+            }
+            "launcher_width" => {
+                cfg.launcher_width = value.as_u64().unwrap_or(480).clamp(320, 800) as u32;
+            }
+            "files_width" => {
+                cfg.files_width = value.as_u64().unwrap_or(400).clamp(280, 800) as u32;
             }
             "opacity" => {
                 cfg.opacity = value.as_u64().unwrap_or(100).clamp(0, 100) as u32;
             }
-            "pause_on_fullscreen" => {
-                cfg.pause_on_fullscreen = value.as_bool().unwrap_or(true);
+            "blur" => {
+                cfg.blur = value.as_u64().unwrap_or(0).clamp(0, 100) as u32;
+            }
+            "non_game_whitelist" => {
+                if let Some(arr) = value.as_array() {
+                    let mut out: Vec<String> = Vec::new();
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            let s = s.trim();
+                            if !s.is_empty() {
+                                out.push(s.to_string());
+                            }
+                        }
+                    }
+                    cfg.non_game_whitelist = out;
+                } else {
+                    return Err("non_game_whitelist must be an array".into());
+                }
             }
             _ => return Err(format!("unknown key: {key}")),
         }
@@ -458,6 +612,26 @@ fn set_setting(
     };
 
     save_config(&snapshot);
+
+    if key == "launcher_width" || key == "files_width" {
+        let label = if key == "launcher_width" { "launcher" } else { "files" };
+        if let Some(w) = app.get_webview_window(label) {
+            if w.is_visible().unwrap_or(false) {
+                let (_, end_x, y, panel_w, panel_h) = panel_geometry(&app, label, &w);
+                let _ = w.set_size(PhysicalSize::new(panel_w as u32, panel_h as u32));
+                let _ = w.set_position(PhysicalPosition::new(end_x, y));
+            }
+        }
+    }
+
+    if key == "blur" {
+        for lbl in ["launcher", "files"] {
+            if let Some(w) = app.get_webview_window(lbl) {
+                apply_blur_effect(&w, snapshot.blur);
+            }
+        }
+    }
+
     let _ = app.emit("settings-changed", &snapshot);
     Ok(())
 }
@@ -536,10 +710,10 @@ fn remove_font(app: AppHandle, name: String) -> Result<(), String> {
 #[tauri::command]
 fn show_settings(app: AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
+        setup_window_decoration(&w);
         let _ = w.center();
         let _ = w.show();
         let _ = w.set_focus();
-        apply_effects_deferred(w.clone(), 100);
     }
 }
 
@@ -551,7 +725,146 @@ fn hide_settings(app: AppHandle) {
 }
 
 // ============================================================
-//  工作区
+//  窗口枚举
+// ============================================================
+#[derive(serde::Serialize)]
+struct WindowInfo {
+    title: String,
+    process: String,
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn enum_windows_cb(
+    hwnd: windows::Win32::Foundation::HWND,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::BOOL {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowTextLengthW, IsWindowVisible, GetWindowThreadProcessId,
+    };
+
+    let list = &mut *(lparam.0 as *mut Vec<WindowInfo>);
+
+    if !IsWindowVisible(hwnd).as_bool() { return windows::Win32::Foundation::BOOL(1); }
+    if GetWindowTextLengthW(hwnd) == 0 { return windows::Win32::Foundation::BOOL(1); }
+
+    let title = window_title(hwnd);
+    if title.trim().is_empty() { return windows::Win32::Foundation::BOOL(1); }
+
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    let process = process_name_by_pid(pid);
+
+    list.push(WindowInfo { title, process });
+    windows::Win32::Foundation::BOOL(1)
+}
+
+#[tauri::command]
+fn list_visible_windows() -> Vec<WindowInfo> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::LPARAM;
+        use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
+        let mut list: Vec<WindowInfo> = Vec::new();
+        unsafe {
+            let _ = EnumWindows(
+                Some(enum_windows_cb),
+                LPARAM(&mut list as *mut _ as isize),
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        list.retain(|w| seen.insert((w.process.clone(), w.title.clone())));
+        list.sort_by(|a, b| a.process.cmp(&b.process).then(a.title.cmp(&b.title)));
+        list
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+// ============================================================
+//  ★ 快捷键注册 / 暂停
+// ============================================================
+fn shortcut_alt1() -> Shortcut {
+    Shortcut::new(Some(Modifiers::ALT), Code::Digit1)
+}
+fn shortcut_alt2() -> Shortcut {
+    Shortcut::new(Some(Modifiers::ALT), Code::Digit2)
+}
+
+/// 注册两个面板快捷键（幂等）
+///
+/// ★ 关键：必须用 `on_shortcut()` 而不是 `register()`。
+///   - `register()` 只把热键交给系统，不会绑定回调
+///   - `on_shortcut()` = 内部 register + 设置 handler，二者缺一不可
+fn register_panel_shortcuts(app: &AppHandle) {
+    let gs = app.global_shortcut();
+
+    // 先清理（避免"已注册"错误导致 on_shortcut 提前返回、handler 不更新）
+    let _ = gs.unregister(shortcut_alt1());
+    let _ = gs.unregister(shortcut_alt2());
+
+    let h1 = app.clone();
+    if let Err(e) = gs.on_shortcut(shortcut_alt1(), move |_app, _sc, ev| {
+        if ev.state == ShortcutState::Pressed {
+            toggle_panel(&h1, "launcher");
+        }
+    }) {
+        eprintln!("[shortcut] Alt+1 注册失败: {e}");
+    }
+
+    let h2 = app.clone();
+    if let Err(e) = gs.on_shortcut(shortcut_alt2(), move |_app, _sc, ev| {
+        if ev.state == ShortcutState::Pressed {
+            toggle_panel(&h2, "files");
+        }
+    }) {
+        eprintln!("[shortcut] Alt+2 注册失败: {e}");
+    }
+
+    eprintln!("[shortcut] 已注册 Alt+1 / Alt+2");
+}
+
+/// 注销两个面板快捷键（把键交给前台程序，比如游戏）
+fn unregister_panel_shortcuts(app: &AppHandle) {
+    let gs = app.global_shortcut();
+    let _ = gs.unregister(shortcut_alt1());
+    let _ = gs.unregister(shortcut_alt2());
+    eprintln!("[shortcut] 已暂停 Alt+1 / Alt+2（全屏游戏占用）");
+}
+
+/// 后台线程：全屏状态切换时暂停 / 恢复快捷键
+fn spawn_fullscreen_watcher(app: AppHandle) {
+    std::thread::spawn(move || {
+        let mut suspended = false;
+        loop {
+            let should_suspend = {
+                let state = app.state::<PanelState>();
+                state.pause_on_fullscreen() && is_fullscreen_app_running(&app)
+            };
+
+            if should_suspend != suspended {
+                suspended = should_suspend;
+                let app2 = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    let state = app2.state::<PanelState>();
+                    state.shortcuts_suspended.store(suspended, Ordering::SeqCst);
+                    if suspended {
+                        unregister_panel_shortcuts(&app2);
+                    } else {
+                        // ★ 用 on_shortcut 恢复（重新绑定 handler）
+                        register_panel_shortcuts(&app2);
+                    }
+                });
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(FULLSCREEN_POLL_MS));
+        }
+    });
+}
+
+// ============================================================
+//  工作区 / 面板几何
 // ============================================================
 #[cfg(windows)]
 fn work_area(w: &WebviewWindow) -> (i32, i32, i32, i32) {
@@ -597,25 +910,44 @@ fn work_area(w: &WebviewWindow) -> (i32, i32, i32, i32) {
     }
 }
 
-fn panel_geometry(label: &str, w: &WebviewWindow) -> (i32, i32, i32, i32, i32) {
+fn panel_logical_width(app: &AppHandle, label: &str) -> f64 {
+    let cfg = app.state::<PanelState>().config_snapshot();
+    if label == "launcher" { cfg.launcher_width as f64 } else { cfg.files_width as f64 }
+}
+
+fn panel_geometry(
+    app: &AppHandle,
+    label: &str,
+    w: &WebviewWindow,
+) -> (i32, i32, i32, i32, i32) {
     let left = label == "launcher";
     let (wx, wy, ww, wh) = work_area(w);
-    let panel_w = w.outer_size().map(|s| s.width as i32)
-        .unwrap_or(if left { 480 } else { 400 });
-    let panel_h = wh - TOP_MARGIN - BOTTOM_MARGIN;
-    let y = wy + TOP_MARGIN;
+
+    let scale = w.scale_factor().unwrap_or(1.0);
+    let edge = (EDGE_MARGIN as f64 * scale).round() as i32;
+    let top = (TOP_MARGIN as f64 * scale).round() as i32;
+    let bottom = (BOTTOM_MARGIN as f64 * scale).round() as i32;
+
+    let panel_w = (panel_logical_width(app, label) * scale).round() as i32;
+    let panel_h = wh - top - bottom;
+    let y = wy + top;
+
     let (start_x, end_x) = if left {
-        (wx - panel_w - EDGE_MARGIN, wx + EDGE_MARGIN)
+        (wx - panel_w - edge, wx + edge)
     } else {
-        (wx + ww + EDGE_MARGIN, wx + ww - panel_w - EDGE_MARGIN)
+        (wx + ww + edge, wx + ww - panel_w - edge)
     };
     (start_x, end_x, y, panel_w, panel_h)
 }
 
 fn do_show(app: &AppHandle, label: &str) {
     let Some(w) = app.get_webview_window(label) else { return; };
-    let (start_x, end_x, y, panel_w, panel_h) = panel_geometry(label, &w);
+    let (start_x, end_x, y, panel_w, panel_h) = panel_geometry(app, label, &w);
+    setup_window_decoration(&w);
     let _ = w.set_size(PhysicalSize::new(panel_w as u32, panel_h as u32));
+
+    let blur = app.state::<PanelState>().config_snapshot().blur;
+    apply_blur_effect(&w, blur);
 
     let cur_x = if w.is_visible().unwrap_or(false) {
         w.outer_position().map(|p| p.x).unwrap_or(start_x)
@@ -625,7 +957,6 @@ fn do_show(app: &AppHandle, label: &str) {
     };
     let _ = w.show();
     let _ = w.set_focus();
-    apply_effects_deferred(w.clone(), 100);
     animate_window_then(
         app.clone(), w, label.to_string(),
         cur_x, end_x, y, SHOW_DURATION, || {},
@@ -638,14 +969,13 @@ fn do_hide(app: &AppHandle, label: &str) {
 
     let left = label == "launcher";
     let (wx, _wy, ww, _wh) = work_area(&w);
-    let panel_w = w.outer_size().map(|s| s.width as i32).unwrap_or(480);
+    let scale = w.scale_factor().unwrap_or(1.0);
+    let edge = (EDGE_MARGIN as f64 * scale).round() as i32;
+    let panel_w = (panel_logical_width(app, label) * scale).round() as i32;
+
     let cur_x = w.outer_position().map(|p| p.x).unwrap_or(wx);
-    let y = w.outer_position().map(|p| p.y).unwrap_or(TOP_MARGIN);
-    let end_x = if left {
-        wx - panel_w - EDGE_MARGIN
-    } else {
-        wx + ww + EDGE_MARGIN
-    };
+    let y = w.outer_position().map(|p| p.y).unwrap_or(0);
+    let end_x = if left { wx - panel_w - edge } else { wx + ww + edge };
 
     let w2 = w.clone();
     animate_window_then(
@@ -658,7 +988,8 @@ fn do_hide(app: &AppHandle, label: &str) {
 fn should_skip_due_to_fullscreen(app: &AppHandle) -> bool {
     let state = app.state::<PanelState>();
     if !state.pause_on_fullscreen() { return false; }
-    is_fullscreen_app_running()
+    if state.shortcuts_suspended.load(Ordering::SeqCst) { return true; }
+    is_fullscreen_app_running(app)
 }
 
 fn toggle_panel(app: &AppHandle, label: &str) {
@@ -743,6 +1074,7 @@ pub fn run() {
             scan_start,
             scan_uwp,
             scan_files,
+            list_dir,
             icon,
             resolve_lnk,
             open,
@@ -752,7 +1084,6 @@ pub fn run() {
             rename_item,
             move_item,
             hide_panel_cmd,
-            get_system_info,
             get_settings,
             set_setting,
             set_autostart,
@@ -760,26 +1091,22 @@ pub fn run() {
             remove_font,
             show_settings,
             hide_settings,
+            list_visible_windows,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
 
-            let alt1 = Shortcut::new(Some(Modifiers::ALT), Code::Digit1);
-            let alt2 = Shortcut::new(Some(Modifiers::ALT), Code::Digit2);
-
-            let h1 = handle.clone();
-            app.global_shortcut().on_shortcut(alt1, move |_app, _sc, ev| {
-                if ev.state == ShortcutState::Pressed {
-                    toggle_panel(&h1, "launcher");
+            for label in ["launcher", "files", "settings"] {
+                if let Some(w) = app.get_webview_window(label) {
+                    setup_window_decoration(&w);
                 }
-            })?;
+            }
 
-            let h2 = handle.clone();
-            app.global_shortcut().on_shortcut(alt2, move |_app, _sc, ev| {
-                if ev.state == ShortcutState::Pressed {
-                    toggle_panel(&h2, "files");
-                }
-            })?;
+            // ★ 注册快捷键（on_shortcut = register + handler）
+            register_panel_shortcuts(&handle);
+
+            // ★ 启动全屏监视
+            spawn_fullscreen_watcher(handle.clone());
 
             let initial_real = {
                 let cfg = app.state::<PanelState>().config_snapshot();
@@ -793,20 +1120,15 @@ pub fn run() {
                 app, "open_f", "打开文件面板  (Alt+2)", true, None::<&str>,
             )?;
             let sep1 = PredefinedMenuItem::separator(app)?;
-
             let refresh_item =
                 MenuItem::with_id(app, "refresh", "刷新", true, None::<&str>)?;
-
             let sep2 = PredefinedMenuItem::separator(app)?;
-
             let real_icons_item = CheckMenuItem::with_id(
                 app, "real_icons", "开启真实图标",
                 true, initial_real, None::<&str>,
             )?;
-
             let settings_item =
                 MenuItem::with_id(app, "settings", "设置…", true, None::<&str>)?;
-
             let sep3 = PredefinedMenuItem::separator(app)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
 
@@ -814,12 +1136,9 @@ pub fn run() {
                 app,
                 &[
                     &open_l, &open_f,
-                    &sep1,
-                    &refresh_item,
-                    &sep2,
-                    &real_icons_item, &settings_item,
-                    &sep3,
-                    &quit,
+                    &sep1, &refresh_item,
+                    &sep2, &real_icons_item, &settings_item,
+                    &sep3, &quit,
                 ],
             )?;
 
@@ -833,10 +1152,7 @@ pub fn run() {
                 .on_menu_event(move |app, ev| match ev.id().as_ref() {
                     "open_l" => show_panel(app, "launcher"),
                     "open_f" => show_panel(app, "files"),
-                    "refresh" => {
-                        let _ = app.emit("refresh-requested", ());
-                        eprintln!("[tray] 已请求刷新");
-                    }
+                    "refresh" => { let _ = app.emit("refresh-requested", ()); }
                     "settings" => show_settings(app.clone()),
                     "real_icons" => {
                         let state = app.state::<PanelState>();
